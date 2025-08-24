@@ -1,0 +1,293 @@
+#!/usr/bin/env bash
+# aur-lite (hardened): AUR helper for the GitHub read-only mirror without full clone.
+# - Partial (default) = shallow cache + on-demand branch fetch
+# - Single            = one-off shallow clone per package
+# - Recursively resolves AUR deps; installs repo deps with pacman
+
+set -euo pipefail
+
+AUR_REMOTE="https://github.com/archlinux/aur.git"
+AUR_MODE="${AUR_MODE:-partial}" # partial | single
+AUR_DIR="${AUR_DIR:-$HOME/.cache/aur-mirror}"
+VERBOSE="${VERBOSE:-}"
+LOCKFILE="/tmp/aur-lite.lock"
+
+need() { command -v "$1" >/dev/null 2>&1 || {
+  echo "Missing command: $1" >&2
+  exit 1
+}; }
+need git
+need makepkg
+need pacman
+
+die() {
+  echo "Error: $*" >&2
+  exit 1
+}
+
+verbose() {
+  [[ -n "${VERBOSE}" ]] && echo "[DEBUG] $*" >&2 || true
+}
+
+cleanup() {
+  local exit_code=$?
+  verbose "Cleaning up (exit code: $exit_code)"
+  # Clean up any remaining worktrees
+  if [[ -d "$AUR_DIR/.git" ]]; then
+    git -C "$AUR_DIR" worktree prune >/dev/null 2>&1 || true
+  fi
+  # Release lock
+  [[ -f "$LOCKFILE" ]] && rm -f "$LOCKFILE"
+  exit $exit_code
+}
+
+# Set up cleanup trap
+trap cleanup EXIT INT TERM
+
+usage() {
+  cat <<EOF
+aur-lite - minimal AUR helper using the GitHub read-only mirror (no RPC)
+
+Usage:
+  aur-lite -S <pkg> [<pkg>...]
+
+Env:
+  AUR_MODE=partial|single   (default: partial)
+  AUR_DIR=~/.cache/aur-mirror
+  VERBOSE=1   enable debug output
+  NOCHECK=1   skip checkdepends
+  NODEV=1     skip makedepends
+  NOINSTALL=1 build without install
+  MAKEPKG_OPTS="--skippgpcheck" (etc.)
+EOF
+}
+
+# ---- helpers ----
+valid_pkgname() {
+  # arch pkgname chars: lowercase alnum and _+-.
+  # Max length 255 per Arch standards
+  local name="$1"
+  [[ ${#name} -le 255 ]] && [[ "$name" =~ ^[a-z0-9][a-z0-9._+-]*$ ]]
+}
+
+# Stricter validation for packages passed to sudo
+validate_pkgnames_strict() {
+  for pkg in "$@"; do
+    if ! valid_pkgname "$pkg"; then
+      die "Invalid package name: $pkg"
+    fi
+    # Additional check: no shell metacharacters
+    if [[ "$pkg" =~ [\$\`\(\)\{\}\[\]\*\?\~\!\&\|\<\>\;] ]]; then
+      die "Package name contains unsafe characters: $pkg"
+    fi
+  done
+}
+
+# Return unique dep names from .SRCINFO (no versions/arch/repo qualifiers), respecting NODEV/NOCHECK
+deps_from_srcinfo() {
+  local src
+  src="$(makepkg --printsrcinfo)"
+  # list "KIND NAME" lines
+  awk '
+    $1=="depends"     && $2=="=" {print "D",$3}
+    $1=="makedepends" && $2=="=" {print "M",$3}
+    $1=="checkdepends"&& $2=="=" {print "C",$3}
+  ' <<<"$src" |
+    while read -r kind name; do
+      [[ -n "$name" ]] || continue
+      name="${name%%[<>=]*}" # strip version rel
+      name="${name##*/}"     # strip repo/
+      name="${name%%:*}"     # strip :arch
+      [[ -n "$name" ]] || continue
+      case "$kind" in
+      D) printf '%s\n' "$name" ;;
+      M) [[ -z "${NODEV:-}" ]] && printf '%s\n' "$name" ;;
+      C) [[ -z "${NOCHECK:-}" ]] && printf '%s\n' "$name" ;;
+      esac
+    done |
+    awk 'NF' |
+    sort -u
+}
+
+ensure_repo_deps_and_collect_aur() {
+  local deps=("$@")
+  local missing=()
+  if ((${#deps[@]})); then
+    # pacman -T prints only missing deps considering provides
+    mapfile -t missing < <(pacman -T "${deps[@]}" 2>/dev/null || true)
+  fi
+  
+  # Batch check all missing packages at once
+  local repo_need=() aur_need=()
+  if ((${#missing[@]})); then
+    verbose "Checking ${#missing[@]} packages in repos"
+    # Get all repo packages in one call
+    local repo_pkgs
+    repo_pkgs=$(pacman -Si -- "${missing[@]}" 2>/dev/null | awk '/^Name/ {print $3}' || true)
+    
+    for p in "${missing[@]:-}"; do
+      [[ -n "$p" ]] || continue
+      if grep -qx "$p" <<<"$repo_pkgs"; then
+        repo_need+=("$p")
+      else
+        aur_need+=("$p")
+      fi
+    done
+  fi
+  
+  if ((${#repo_need[@]})); then
+    # Validate package names before sudo
+    validate_pkgnames_strict "${repo_need[@]}"
+    verbose "Installing ${#repo_need[@]} repo dependencies"
+    sudo pacman -S --needed -- "${repo_need[@]}"
+  fi
+  printf '%s\n' "${aur_need[@]:-}"
+}
+
+# ---- fetch/checkout strategies ----
+ensure_partial_repo() {
+  if [[ ! -d "$AUR_DIR/.git" ]]; then
+    mkdir -p "$(dirname "$AUR_DIR")"
+    git clone --depth=1 "$AUR_REMOTE" "$AUR_DIR"
+  fi
+}
+
+partial_checkout_into() {
+  local pkg="$1" workdir="$2"
+  ensure_partial_repo
+  
+  # Use file locking to prevent race conditions
+  (
+    flock -x 200
+    verbose "Fetching branch $pkg"
+    git -C "$AUR_DIR" remote set-branches --add origin "$pkg" >/dev/null 2>&1 || true
+    # fetch just that branch shallowly
+    if ! git -C "$AUR_DIR" fetch --depth=1 origin "$pkg" 2>&3; then
+      echo "Failed to fetch package: $pkg" >&2
+      return 1
+    fi
+    # create a detached worktree at that branch tip
+    if ! git -C "$AUR_DIR" worktree add --detach "$workdir" "origin/$pkg" >/dev/null 2>&1; then
+      # Try to remove existing worktree and retry
+      verbose "Worktree conflict, attempting cleanup"
+      git -C "$AUR_DIR" worktree remove --force "$workdir" >/dev/null 2>&1 || true
+      if ! git -C "$AUR_DIR" worktree add --detach "$workdir" "origin/$pkg" >/dev/null 2>&1; then
+        echo "Failed to create worktree for: $pkg" >&2
+        return 1
+      fi
+    fi
+  ) 200>"$LOCKFILE" 3>&2
+}
+
+single_branch_clone_into() {
+  local pkg="$1" workdir="$2"
+  git clone --branch "$pkg" --single-branch --depth=1 "$AUR_REMOTE" "$workdir"
+}
+
+prepare_pkg_dir() {
+  local pkg="$1" dir
+  dir="$(mktemp -d -t aurpkg.XXXXXX)" || die "Failed to create temp directory"
+  
+  verbose "Preparing package directory for $pkg in $dir"
+  if [[ "$AUR_MODE" == "single" ]]; then
+    if ! single_branch_clone_into "$pkg" "$dir"; then
+      rm -rf "$dir"
+      return 1
+    fi
+  else
+    if ! partial_checkout_into "$pkg" "$dir"; then
+      rm -rf "$dir"
+      git -C "$AUR_DIR" worktree prune >/dev/null 2>&1 || true
+      return 1
+    fi
+  fi
+  printf '%s\n' "$dir"
+}
+
+# ---- build (recursive) ----
+declare -A VISITED
+
+build_pkg_recursive() {
+  local pkg="$1"
+
+  # reject empty or invalid names early
+  if [[ -z "${pkg:-}" ]] || ! valid_pkgname "$pkg"; then
+    return 0
+  fi
+
+  # safe "is in map" check (works with set -u)
+  if [[ ${VISITED[$pkg]+_} ]]; then
+    return 0
+  fi
+  VISITED["$pkg"]=1
+
+  local pkgdir
+  if ! pkgdir="$(prepare_pkg_dir "$pkg")"; then
+    die "No such AUR branch/package: $pkg"
+  fi
+  pushd "$pkgdir" >/dev/null
+
+  # deps -> repo deps installed, AUR deps collected
+  mapfile -t deps < <(deps_from_srcinfo || true)
+  # Use proper array check instead of risky operation
+  verbose "Found ${#deps[@]} dependencies for $pkg"
+  mapfile -t aur_missing < <(ensure_repo_deps_and_collect_aur "${deps[@]:-}" || true)
+
+  # build AUR deps first
+  for apkg in "${aur_missing[@]:-}"; do
+    [[ -n "$apkg" ]] && valid_pkgname "$apkg" || continue
+    build_pkg_recursive "$apkg"
+  done
+
+  # build this package
+  if [[ -n "${NOINSTALL:-}" ]]; then
+    makepkg -s --noconfirm ${MAKEPKG_OPTS:-}
+  else
+    makepkg -si --noconfirm ${MAKEPKG_OPTS:-}
+  fi
+
+  popd >/dev/null
+
+  # cleanup temp checkout
+  verbose "Cleaning up package directory for $pkg"
+  if [[ "$AUR_MODE" == "single" ]]; then
+    rm -rf "$pkgdir"
+  else
+    git -C "$AUR_DIR" worktree remove --force "$pkgdir" >/dev/null 2>&1 || rm -rf "$pkgdir"
+  fi
+}
+
+main() {
+  if [[ $# -lt 1 ]]; then
+    usage
+    exit 1
+  fi
+  case "$1" in
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  -S)
+    shift
+    [[ $# -ge 1 ]] || {
+      echo "No packages provided." >&2
+      exit 1
+    }
+    for pkg in "$@"; do
+      verbose "Starting build for package: $pkg"
+      build_pkg_recursive "$pkg"
+    done
+    # Final cleanup of all worktrees
+    if [[ -d "$AUR_DIR/.git" ]]; then
+      verbose "Final worktree cleanup"
+      git -C "$AUR_DIR" worktree prune >/dev/null 2>&1 || true
+    fi
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+  esac
+}
+
+main "$@"
